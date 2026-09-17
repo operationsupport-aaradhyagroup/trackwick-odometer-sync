@@ -1,375 +1,178 @@
-const TRACKWICK_BASE = "https://apis2s.trackwick.com";
+import { db, ensureSchema } from "../../lib/db.js";
+import { checkSecret, normalizeDate } from "../../lib/helpers.js";
+
+const BASE = "https://apis2s.trackwick.com";
 
 function trackwickHeaders() {
-  const customerId = process.env.TRACKWICK_CUSTOMER_ID;
-  const apiKey = process.env.TRACKWICK_API_KEY;
-
-  if (!customerId || !apiKey) {
-    throw new Error("Missing TRACKWICK_CUSTOMER_ID or TRACKWICK_API_KEY");
-  }
-
   return {
     "Content-Type": "application/json",
     "platform": "API",
-    "tlp-cid": customerId,
+    "tlp-cid": process.env.TRACKWICK_CUSTOMER_ID || "",
     "tlp-t": String(Date.now()),
-    "api-key": apiKey
+    "api-key": process.env.TRACKWICK_API_KEY || ""
   };
 }
 
-function normalizeDate(value) {
-  if (!value) return null;
+async function getExpenseList(employeeIden, date) {
+  const url = new URL(`${BASE}/cust/1/api/expense/list`);
+  url.searchParams.set("pt", "50");
+  url.searchParams.set("pn", "0");
+  url.searchParams.set("showForm", "true");
+  url.searchParams.set("employeeIds", employeeIden);
+  url.searchParams.set("dateFrom", date);
+  url.searchParams.set("dateTo", date);
 
-  const raw = String(value).trim();
-
-  // Already yyyy-MM-dd
-  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
-
-  // dd-MM-yyyy
-  const dmyDash = raw.match(/^(\d{2})-(\d{2})-(\d{4})$/);
-  if (dmyDash) return `${dmyDash[3]}-${dmyDash[2]}-${dmyDash[1]}`;
-
-  // dd/MM/yyyy
-  const dmySlash = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (dmySlash) return `${dmySlash[3]}-${dmySlash[2]}-${dmySlash[1]}`;
-
-  const d = new Date(raw);
-  if (!Number.isNaN(d.getTime())) {
-    return d.toISOString().slice(0, 10);
-  }
-
-  return null;
+  const r = await fetch(url, { headers: trackwickHeaders() });
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!r.ok) throw new Error(`Trackwick expense list failed ${r.status}: ${text}`);
+  return data;
 }
 
-async function getExpenseList({ employeeIden, date }) {
-  const qs = new URLSearchParams({
-    pt: "50",
-    pn: "0",
-    showForm: "true",
-    employeeIds: employeeIden,
-    dateFrom: date,
-    dateTo: date
-  });
-
-  const response = await fetch(
-    `${TRACKWICK_BASE}/cust/1/api/expense/list?${qs.toString()}`,
-    {
-      method: "GET",
-      headers: trackwickHeaders()
-    }
-  );
-
-  const text = await response.text();
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = { raw: text };
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Trackwick expense list failed: HTTP ${response.status} ${JSON.stringify(body)}`
-    );
-  }
-
-  return body;
+function findExpense(resp, expenseIden) {
+  const candidates = resp?.data || resp?.expenses || resp?.result || [];
+  if (!Array.isArray(candidates)) return null;
+  return candidates.find(x =>
+    x?.iden === expenseIden ||
+    x?.expenseIden === expenseIden ||
+    x?.expense_iden === expenseIden
+  ) || null;
 }
 
-function findExpense(expenseResponse, expenseIden) {
-  const rows =
-    expenseResponse?.data ||
-    expenseResponse?.expenses ||
-    expenseResponse?.result ||
-    [];
-
-  if (!Array.isArray(rows)) return null;
-
-  return (
-    rows.find(
-      (row) =>
-        String(row?.iden || row?.expenseIden || row?.expense_iden || "") ===
-        String(expenseIden)
-    ) || null
-  );
-}
-
-async function getAttendanceDetails({ employeeIden, date }) {
-  /*
-   * IMPORTANT:
-   * The supplied Trackwick API documentation only documents:
-   *   GET /integration/api/get?type=punchin|punchout...
-   *   POST /cust/1/api/punch/in/out
-   *
-   * Those documented endpoints do NOT return odometer KM/photo details.
-   * Therefore this function intentionally refuses to guess an undocumented API.
-   *
-   * When Trackwick gives you the attendance-detail endpoint, set:
-   * TRACKWICK_ATTENDANCE_DETAIL_URL
-   *
-   * Supported placeholders:
-   *   {employeeIden}
-   *   {date}
-   */
-  const template = process.env.TRACKWICK_ATTENDANCE_DETAIL_URL;
-  if (!template) {
-    return {
-      configured: false,
-      reason:
-        "TRACKWICK_ATTENDANCE_DETAIL_URL is not configured. The public docs supplied do not expose attendance odometer details."
-    };
-  }
-
-  const url = template
-    .replaceAll("{employeeIden}", encodeURIComponent(employeeIden))
-    .replaceAll("{date}", encodeURIComponent(date));
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: trackwickHeaders()
-  });
-
-  const text = await response.text();
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = { raw: text };
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Attendance detail fetch failed: HTTP ${response.status} ${JSON.stringify(body)}`
-    );
-  }
-
-  return { configured: true, body };
-}
-
-function extractOdometer(attendanceBody) {
-  /*
-   * Once we receive one real attendance JSON response, map the exact
-   * field names here. The function already checks common variants.
-   */
-  const root = attendanceBody?.data ?? attendanceBody ?? {};
-
-  const startKm =
-    root?.bikeStartingOdometerKm ??
-    root?.bike_starting_odometer_km ??
-    root?.startingOdometerKm ??
-    root?.startKm ??
-    null;
-
-  const endKm =
-    root?.bikeEndingOdometerKm ??
-    root?.bike_ending_odometer_km ??
-    root?.endingOdometerKm ??
-    root?.endKm ??
-    null;
-
-  const startPhoto =
-    root?.bikeStartingOdometerPhoto ??
-    root?.bike_starting_odometer_photo ??
-    root?.startingOdometerPhoto ??
-    root?.startPhoto ??
-    null;
-
-  const endPhoto =
-    root?.bikeEndingOdometerPhoto ??
-    root?.bike_ending_odometer_photo ??
-    root?.endingOdometerPhoto ??
-    root?.endPhoto ??
-    null;
-
-  return { startKm, endKm, startPhoto, endPhoto };
-}
-
-async function updateExpense({ expenseId, expenseIden, odometer }) {
-  /*
-   * The supplied docs include Expense LIST and Expense STAGE UPDATE,
-   * but not a documented endpoint to update custom expense form fields.
-   *
-   * When Trackwick confirms that endpoint, set TRACKWICK_EXPENSE_UPDATE_URL.
-   *
-   * Supported placeholders:
-   *   {expenseId}
-   *   {expenseIden}
-   */
+async function updateExpense(expense, expenseIden, odometer) {
   const template = process.env.TRACKWICK_EXPENSE_UPDATE_URL;
+  if (!template) return { configured: false };
 
-  if (!template) {
-    return {
-      configured: false,
-      reason:
-        "TRACKWICK_EXPENSE_UPDATE_URL is not configured. Supplied docs do not document custom expense form-field update."
-    };
-  }
-
+  const expenseId = expense?.id || expense?._id || expense?.dbId || "";
   const url = template
-    .replaceAll("{expenseId}", encodeURIComponent(expenseId || ""))
-    .replaceAll("{expenseIden}", encodeURIComponent(expenseIden || ""));
+    .replace("{expenseId}", encodeURIComponent(expenseId))
+    .replace("{expenseIden}", encodeURIComponent(expenseIden));
 
-  // These titles must exactly match the Trackwick form field titles.
   const payload = {
     data: {
       "Start KM": odometer.startKm,
       "Starting Odometer Photo": odometer.startPhoto,
       "End KM": odometer.endKm,
       "Ending Odometer Photo": odometer.endPhoto,
-      "Total KM":
-        odometer.startKm != null && odometer.endKm != null
-          ? Number(odometer.endKm) - Number(odometer.startKm)
-          : null
+      "Total KM": odometer.totalKm
     }
   };
 
-  const response = await fetch(url, {
+  const r = await fetch(url, {
     method: "POST",
     headers: trackwickHeaders(),
     body: JSON.stringify(payload)
   });
-
-  const text = await response.text();
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
-    body = { raw: text };
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      `Expense update failed: HTTP ${response.status} ${JSON.stringify(body)}`
-    );
-  }
-
-  return { configured: true, body, payload };
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
+  if (!r.ok) throw new Error(`Expense update failed ${r.status}: ${text}`);
+  return { configured: true, data };
 }
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({
-      ok: false,
-      error: "Method not allowed. Use POST."
-    });
+    return res.status(405).json({ ok: false, message: "POST only" });
+  }
+  if (!checkSecret(req)) {
+    return res.status(401).json({ ok: false, message: "Invalid webhook secret" });
   }
 
   try {
-    const expectedSecret = process.env.TRACKWICK_WEBHOOK_SECRET;
-    if (expectedSecret) {
-      const actualSecret = req.headers["x-webhook-secret"];
-      if (actualSecret !== expectedSecret) {
-        return res.status(401).json({
-          ok: false,
-          error: "Invalid webhook secret"
-        });
-      }
-    }
+    await ensureSchema();
 
-    const body =
-      typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
-
-    console.log(
-      "TRACKWICK_EXPENSE_CREATE",
-      JSON.stringify({
-        receivedAt: new Date().toISOString(),
-        body
-      })
-    );
-
-    const expenseIden =
-      body.expense_iden || body.expenseIden || body.iden || null;
-    const expenseType =
-      body.expense_type || body.expenseType || body.type || null;
-    const employeeIden =
-      body.employee_iden || body.employeeIden || body.employee || null;
-    const claimedDate = normalizeDate(
-      body.claimed_date || body.claimedDate || body.date
-    );
+    const body = req.body || {};
+    const expenseIden = body.expense_iden;
+    const employeeIden = body.employee_iden;
+    const claimedDate = normalizeDate(body.claimed_date);
 
     if (!expenseIden || !employeeIden || !claimedDate) {
       return res.status(200).json({
-        ok: false,
-        ignored: true,
-        reason:
-          "Required webhook values are missing. Need expense_iden, employee_iden and claimed_date.",
+        ok: true,
+        phase: "EXPENSE_IGNORED",
+        message: "expense_iden, employee_iden or claimed_date missing",
         received: body
       });
     }
 
-    // Keep this permissive initially because Trackwick may send different naming.
-    if (
-      expenseType &&
-      !String(expenseType).toLowerCase().includes("travel") &&
-      !String(expenseType).toLowerCase().includes("expense")
-    ) {
+    const expenseResponse = await getExpenseList(employeeIden, claimedDate);
+    const expense = findExpense(expenseResponse, expenseIden);
+
+    if (!expense) {
       return res.status(200).json({
         ok: true,
-        ignored: true,
-        reason: `Expense type ignored: ${expenseType}`
+        phase: "EXPENSE_NOT_FOUND",
+        expenseIden,
+        employeeIden,
+        claimedDate
       });
     }
 
-    // 1. Verify/fetch the expense record using documented API.
-    const expenseResponse = await getExpenseList({
-      employeeIden,
-      date: claimedDate
-    });
-    const expense = findExpense(expenseResponse, expenseIden);
+    const sql = db();
+    const rows = await sql`
+      SELECT *
+      FROM attendance_odometer
+      WHERE employee_iden = ${employeeIden}
+        AND attendance_date = ${claimedDate}
+      LIMIT 1
+    `;
 
-    // 2. Attempt attendance detail only if endpoint has been configured.
-    const attendanceResult = await getAttendanceDetails({
-      employeeIden,
-      date: claimedDate
-    });
-
-    if (!attendanceResult.configured) {
+    if (!rows.length) {
       return res.status(200).json({
         ok: true,
-        phase: "EXPENSE_VERIFIED_WAITING_FOR_ATTENDANCE_API",
-        expenseFound: Boolean(expense),
+        phase: "ATTENDANCE_ODOMETER_NOT_FOUND",
+        expenseFound: true,
         expenseIden,
         employeeIden,
         claimedDate,
-        message: attendanceResult.reason,
-        nextStep:
-          "Provide one Trackwick attendance-detail API response or endpoint that contains the odometer KM/photo fields."
+        message: "No Punch In/Punch Out odometer record has been stored for this employee/date."
       });
     }
 
-    const odometer = extractOdometer(attendanceResult.body);
+    const row = rows[0];
+    const startKm = row.start_km === null ? null : Number(row.start_km);
+    const endKm = row.end_km === null ? null : Number(row.end_km);
+    const totalKm = startKm !== null && endKm !== null && endKm >= startKm
+      ? endKm - startKm
+      : null;
 
-    // 3. Stop safely if mapping is not yet confirmed.
-    if (
-      odometer.startKm == null &&
-      odometer.endKm == null &&
-      !odometer.startPhoto &&
-      !odometer.endPhoto
-    ) {
+    const odometer = {
+      startKm,
+      startPhoto: row.start_photo,
+      endKm,
+      endPhoto: row.end_photo,
+      totalKm,
+      odometerValid: startKm !== null && endKm !== null ? endKm >= startKm : null
+    };
+
+    if (!odometer.odometerValid) {
       return res.status(200).json({
         ok: true,
-        phase: "ATTENDANCE_RECEIVED_MAPPING_REQUIRED",
-        expenseFound: Boolean(expense),
-        attendanceSample: attendanceResult.body,
-        message:
-          "Attendance API responded, but odometer field names are not mapped yet. Use the returned attendanceSample to update extractOdometer()."
+        phase: "ODOMETER_INVALID_OR_INCOMPLETE",
+        expenseFound: true,
+        attendanceFound: true,
+        expenseIden,
+        employeeIden,
+        claimedDate,
+        odometer,
+        message: "Start/end KM are incomplete or End KM is lower than Start KM. Expense was not updated."
       });
     }
 
-    // 4. Update expense only if the undocumented update URL is configured.
-    const updateResult = await updateExpense({
-      expenseId: expense?.id || expense?._id || null,
-      expenseIden,
-      odometer
-    });
+    const result = await updateExpense(expense, expenseIden, odometer);
 
-    if (!updateResult.configured) {
+    if (!result.configured) {
       return res.status(200).json({
         ok: true,
         phase: "ODOMETER_FOUND_WAITING_FOR_EXPENSE_UPDATE_API",
-        expenseFound: Boolean(expense),
+        expenseFound: true,
+        attendanceFound: true,
+        expenseIden,
+        employeeIden,
+        claimedDate,
         odometer,
-        message: updateResult.reason
+        message: "Database lookup is working. Set TRACKWICK_EXPENSE_UPDATE_URL after the exact Trackwick expense edit/update request is identified."
       });
     }
 
@@ -380,14 +183,14 @@ export default async function handler(req, res) {
       employeeIden,
       claimedDate,
       odometer,
-      trackwickUpdate: updateResult.body
+      updateResult: result.data
     });
   } catch (error) {
-    console.error("TRACKWICK_ODOMETER_SYNC_ERROR", error);
-
+    console.error("TRAVEL_EXPENSE_ERROR", error);
     return res.status(500).json({
       ok: false,
-      error: error?.message || "Unknown error"
+      phase: "TRAVEL_EXPENSE_ERROR",
+      message: error.message
     });
   }
 }

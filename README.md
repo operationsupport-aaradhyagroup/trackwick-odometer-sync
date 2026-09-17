@@ -1,98 +1,65 @@
-# Trackwick Travel Expense Odometer Sync
+# Trackwick Odometer Sync v3
 
-This is a small Vercel Node.js middleware for:
+This version adds persistent PostgreSQL storage.
 
-Trackwick Expense Create webhook
-→ identify employee + claimed date
-→ verify Travel Expense via Trackwick Expense List API
-→ fetch Attendance details
-→ copy Start KM / Start Photo / End KM / End Photo
-→ update the same Travel Expense.
+## Endpoints
 
-## What already works
+- `GET /api/health`
+- `POST /api/trackwick/punch-in`
+- `POST /api/trackwick/punch-out`
+- `POST /api/trackwick/travel-expense`
 
-The project uses the documented Trackwick Expense List endpoint:
+## Required Vercel environment variables
 
-GET https://apis2s.trackwick.com/cust/1/api/expense/list
-
-with:
-- showForm=true
-- employeeIds=<employee id/idEN>
-- dateFrom=yyyy-MM-dd
-- dateTo=yyyy-MM-dd
-
-It also sends the documented headers:
-- platform: API
-- tlp-cid
-- tlp-t
-- api-key
-
-## What Trackwick documentation does NOT provide
-
-The supplied API documentation does not document:
-1. An attendance-detail endpoint that returns odometer KM + odometer photos.
-2. An expense update endpoint that updates custom form fields.
-
-Therefore the project does not guess these APIs.
-
-As soon as Trackwick confirms those two endpoints, set:
-
-TRACKWICK_ATTENDANCE_DETAIL_URL=
+```text
+DATABASE_URL=postgresql://...
+TRACKWICK_CUSTOMER_ID=...
+TRACKWICK_API_KEY=...
+TRACKWICK_WEBHOOK_SECRET=...
 TRACKWICK_EXPENSE_UPDATE_URL=
+```
 
-The code will then continue automatically.
+`TRACKWICK_EXPENSE_UPDATE_URL` should remain blank until the exact Trackwick expense edit/update endpoint is captured.
 
-## Deploy to Vercel
+## Trackwick Punch In payload
 
-1. Create a new GitHub repo, for example:
-   trackwick-odometer-sync
-
-2. Upload all files in this project.
-
-3. Import that repository into Vercel.
-
-4. Add Environment Variables:
-   TRACKWICK_CUSTOMER_ID
-   TRACKWICK_API_KEY
-   TRACKWICK_WEBHOOK_SECRET
-
-5. Deploy.
-
-## Health check
-
-Open:
-
-https://YOUR-PROJECT.vercel.app/api/health
-
-Expected result:
-
+```json
 {
-  "ok": true,
-  "service": "trackwick-odometer-sync"
+  "iden": "{$employee_iden}",
+  "employee_id": "{$employee_id}",
+  "punch_in_time": "{$punch_in_time}",
+  "bike_starting_odometer_photo": "{$form_data_Bike Starting Odometer Photo}",
+  "bike_starting_odometer_km": "{$form_data_Bike Starting Odometer KM}"
 }
-
-## Trackwick Webhook
-
-Create webhook:
-
-Title:
-Travel Expense Odometer Sync
-
-Trigger:
-Expense Create
+```
 
 URL:
-https://YOUR-PROJECT.vercel.app/api/trackwick/travel-expense
 
-HTTP Get:
-OFF
+```text
+https://trackwick-odometer-sync.vercel.app/api/trackwick/punch-in
+```
 
-Webhook header:
+## Trackwick Punch Out payload
 
-X-Webhook-Secret: <same value as TRACKWICK_WEBHOOK_SECRET>
+```json
+{
+  "iden": "{$employee_iden}",
+  "employee_id": "{$employee_id}",
+  "punch_out_time": "{$punch_out_time}",
+  "bike_ending_odometer_photo": "{$form_data_Bike Ending Odometer Photo}",
+  "bike_ending_odometer_km": "{$form_data_Bike Ending Odometer KM}"
+}
+```
 
-Post Data:
+URL:
 
+```text
+https://trackwick-odometer-sync.vercel.app/api/trackwick/punch-out
+```
+
+## Expense Create payload
+
+```json
 {
   "expense_title": "{$expense_title}",
   "expense_iden": "{$expense_iden}",
@@ -101,36 +68,44 @@ Post Data:
   "employee_iden": "{$employee_iden}",
   "employee_name": "{$employee_name}"
 }
+```
 
-## First test
+URL:
 
-Submit one Travel Expense.
+```text
+https://trackwick-odometer-sync.vercel.app/api/trackwick/travel-expense
+```
 
-Then Vercel:
-Project → Logs
+## Database behavior
 
-Search for:
+The app automatically creates a table called `attendance_odometer`.
 
-TRACKWICK_EXPENSE_CREATE
+Unique key:
+- `employee_iden`
+- `attendance_date`
 
-The endpoint will also return a phase value. Initially it should reach:
+Punch In stores:
+- start KM
+- start photo
+- punch-in time
 
-EXPENSE_VERIFIED_WAITING_FOR_ATTENDANCE_API
+Punch Out stores:
+- end KM
+- end photo
+- punch-out time
 
-That confirms:
-- Webhook works
-- Employee/date parsing works
-- Trackwick authentication works
-- Expense lookup works
+Expense Create finds the row for the same employee and claimed date.
 
-Then we only need the actual attendance-detail endpoint and the custom expense-form update endpoint.
+## Expected phases
 
-## Required Trackwick form titles
+Punch In:
+- `PUNCH_IN_STORED`
 
-These must remain exactly as configured in Trackwick:
+Punch Out:
+- `PUNCH_OUT_STORED`
 
-Start KM
-Starting Odometer Photo
-End KM
-Ending Odometer Photo
-Total KM
+Expense Create before expense update API is configured:
+- `ODOMETER_FOUND_WAITING_FOR_EXPENSE_UPDATE_API`
+
+If End KM < Start KM:
+- `ODOMETER_INVALID_OR_INCOMPLETE`
